@@ -10,6 +10,7 @@ import asyncio
 import re
 from dotenv import load_dotenv
 import os
+from collections import Counter
 
 load_dotenv()
 
@@ -30,7 +31,7 @@ class Game:
         self.chat_id = chat_id
         self.host_id = host_id
         self.topic_id = None
-        self.mode = None  # "elimination" или "normal"
+        self.mode = None
         self.show_eliminated_nicks = False
         self.can_join_late = False
         self.skip_allowed = True
@@ -39,7 +40,8 @@ class Game:
         self.participants = {}
         self.current_round = 0
         self.round_active = False
-        self.photos_this_round = {}
+        self.photos_this_round = {}      # данные текущего раунда
+        self.photos_all_rounds = {}      # все раунды
         self.last_round_message_id = None
         self.host_menu_message_id = None
 
@@ -241,7 +243,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         game.started = True
-        await query.edit_message_text("🎮 Игра запущена!")
+        await query.edit_message_text(
+            f"🎮 Игра запущена!\n\n"
+            f"🟢 /call_private – позовет в ЛС участников, не приславших фото в этом раунде, но которые участвовали раньше.\n"
+            f"🟢 /call_public – также позовет участников, а в теме покажет список людей, не приславших фото.\n"
+            f"🟢 /check_photos – пришлет, сколько участников не прислали работы в этом раунде.\n\n"
+            f"⚡ Дополнительно:\n"
+            f"⭐ Чтобы засчитать участнику баллы – ответьте на его фото +1б (или больше, например +10б).\n"
+            f"❌ Чтобы участник выбывал из игры – ответьте на фото вылет.\n"
+            f"👤 Чтобы показать автора фото – ответьте на фото кто автор.\n"
+            f"🔄 Чтобы дать участнику возможность отправить фото повторно – ответьте на фото повтор.\n",
+            parse_mode="None"
+        )
         await start_round(game, context)
         await show_host_menu(game, context)
         return
@@ -252,7 +265,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del games[user_id]
         await query.edit_message_text("🚩 Все настройки сброшены. Начните заново командой /start_game")
         return
-
 
 # -------------------- МЕНЮ ВЕДУЩЕГО --------------------
 async def show_host_menu(game: Game, context: ContextTypes.DEFAULT_TYPE):
@@ -276,7 +288,7 @@ async def show_host_menu(game: Game, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"Ошибка show_host_menu: {e}")
 
-# -------------------- РАУНД --------------------
+
 async def start_round(game: Game, context: ContextTypes.DEFAULT_TYPE):
     if game.round_active:
         await context.bot.send_message(chat_id=game.host_id, text=f"Раунд {game.current_round} уже идет.")
@@ -294,7 +306,6 @@ async def start_round(game: Game, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("💌 Прислать фото в ЛС боту", url=f"https://t.me/{BOT_USERNAME[1:]}")]]
 
     if game.current_round == 1:
-        # Полная информация для первого раунда
         skip_text = "✅" if game.skip_allowed else "❌"
         mode_text = "Выбывание" if game.mode == "elimination" else "Баллы"
         can_join_text = "✅" if game.can_join_late else "❌"
@@ -315,18 +326,29 @@ async def start_round(game: Game, context: ContextTypes.DEFAULT_TYPE):
             f"📩 Присылайте фото в ЛС бота!"
         )
     else:
-        # Только короткое сообщение для последующих раундов
         text_message = (
             f"🔥 Раунд {game.current_round} стартовал!\n\n"
             f"📩 Присылайте фото в ЛС бота!"
         )
 
-    await context.bot.send_message(
+    # Отправка сообщения в тему и сохранение его ID
+    round_start_msg = await context.bot.send_message(
         chat_id=MAIN_CHAT_ID,
         message_thread_id=game.topic_id,
         text=text_message,
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
+    game.last_round_message_id = round_start_msg.message_id
+
+    # Закрепление сообщения
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=MAIN_CHAT_ID,
+            message_id=game.last_round_message_id,
+            disable_notification=True
+        )
+    except Exception as e:
+        print(f"Ошибка закрепления сообщения: {e}")
 
 # -------------------- НОВЫЙ РАУНД --------------------
 async def next_round(game: Game, context: ContextTypes.DEFAULT_TYPE):
@@ -345,6 +367,25 @@ async def next_round(game: Game, context: ContextTypes.DEFAULT_TYPE):
         text=f"🏳️ Раунд {game.current_round} начался."
     )
 
+    # Уведомление активных участников (со 2-го раунда)
+    if game.current_round > 1:
+        for user_id, pdata in game.participants.items():
+            if not pdata.get("eliminated", False):  # только активные
+                try:
+                    # Кнопка "Перейти в тему"
+                    keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("💖 Перейти в тему", url=f"https://t.me/c/{str(MAIN_CHAT_ID)[4:]}/{game.topic_id}")]
+                    ])
+
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"🟢 Раунд {game.current_round} начался! Пришлите своё фото/ответ.",
+                        reply_markup=keyboard
+                    )
+                except Exception as e:
+                    user_display = f"@{pdata.get('username')}" if pdata.get("username") else pdata.get("nickname")
+                    print(f"Не удалось уведомить {user_display}: {e}")
+
 # -------------------- ОБРАБОТКА ФОТО --------------------
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not getattr(update, "message", None):
@@ -360,7 +401,8 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("👀 Сейчас нет активного раунда.")
         return
 
-    user_id = update.message.from_user.id
+    user = update.message.from_user
+    user_id = user.id
     photo_file_id = update.message.photo[-1].file_id
 
     is_first_round = game.current_round == 1
@@ -368,7 +410,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     can_join = is_first_round or game.can_join_late
 
     if not user_in_game and not can_join:
-        await update.message.reply_text("👀 Вы не можете присоединиться к игре. Ведь она стартовала без вас.")
+        await update.message.reply_text("👀 Вы не можете присоединиться к игре. Она уже стартовала без вас.")
         return
 
     if not user_in_game and game.participant_limit and len(game.participants) >= game.participant_limit:
@@ -385,16 +427,15 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("📮 Вы уже отправили фото в этом раунде.")
             return
 
-    # Добавляем нового участника, если нужно
-    user = update.message.from_user
-
-    game.participants[user.id] = {
-        "nickname": user.full_name,                 # красивое имя (для таблиц и результатов)
-        "username": user.username,                  # @username, если есть
-        "score": 0,
-        "eliminated": False,
-        "rounds_played": []
-    }
+    # Добавляем нового участника, если его ещё нет
+    if not user_in_game:
+        game.participants[user_id] = {
+            "nickname": user.full_name,       # красивое имя (для таблиц и результатов)
+            "username": user.username,        # @username, если есть
+            "score": 0,
+            "eliminated": False,
+            "rounds_played": []
+        }
 
     # Отправляем фото в тему
     sent_msg = await context.bot.send_photo(
@@ -404,12 +445,22 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=f"📸 Фото #{len([p for p in game.photos_this_round.values() if p != 'REPEAT']) + 1} (Раунд {game.current_round})"
     )
 
-    # Сохраняем данные о фото
+    # Сохраняем данные о фото в текущем раунде
     game.photos_this_round[user_id] = {
         "file_id": photo_file_id,
         "message_id": sent_msg.message_id
     }
+
+    # Добавляем текущий раунд в историю участника
     game.participants[user_id]["rounds_played"].append(game.current_round)
+
+    # Сохраняем фото в общее хранилище всех раундов
+    if game.current_round not in game.photos_all_rounds:
+        game.photos_all_rounds[game.current_round] = {}
+    game.photos_all_rounds[game.current_round][user_id] = {
+        "file_id": photo_file_id,
+        "message_id": sent_msg.message_id
+    }
 
     await update.message.reply_text("Фото принято ♥️")
 
@@ -447,19 +498,39 @@ async def reply_on_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # Начисление баллов
-    if text.startswith("+") and text.endswith("б"):
-        number_part = text[1:-1]
-        if number_part.isdigit():
-            if game.photos_this_round[author_id] == "REPEAT":
-                await update.message.reply_text("✖️ Фото не участвует в раунде, его нельзя оценивать. ✖️")
+    if update.message.from_user.id == game.host_id:
+        if text.startswith("+") and text.endswith("б"):
+            number_part = text[1:-1]
+            if number_part.isdigit():
+                if game.photos_this_round[author_id] == "REPEAT":
+                    await update.message.reply_text("✖️ Фото не участвует в раунде, его нельзя оценивать. ✖️")
+                    return
+                points = int(number_part)
+                game.participants[author_id]["score"] += points
+                nickname = game.participants[author_id]["nickname"]
+                nickname_display = f"@{nickname}" if game.show_nicks else ""
+                await update.message.reply_text(f"💸 Автору {nickname_display} зачислено {points}б.")
+                await context.bot.send_message(chat_id=author_id, text=f" 💸 Вам зачислено {points}б. Ваша общая сумма: {game.participants[author_id]['score']}б.")
+            return
+    
+    # Снятие баллов
+    if update.message.from_user.id == game.host_id:
+        if (text.startswith("-") and text.endswith("б")):
+            if update.message.from_user.id != game.host_id:
                 return
-            points = int(number_part)
-            game.participants[author_id]["score"] += points
-            nickname = game.participants[author_id]["nickname"]
-            nickname_display = f"@{nickname}" if game.show_nicks else "игрок"
-            await update.message.reply_text(f"💸 Автору {nickname_display} зачислено {points} б.")
-            await context.bot.send_message(chat_id=author_id, text=f" 💸 Вам зачислено {points} б.")
-        return
+            num = text[1:-1]
+            if num.isdigit():
+                points = int(num)
+
+                game.participants[author_id]["score"] -= points
+
+                await update.message.reply_text("Баллы сняты.")
+                await context.bot.send_message(
+                    chat_id=author_id,
+                    text=f"У вас сняли {points}б. Общая сумма: {game.participants[author_id]['score']}б."
+                )
+                return
+        
 
     # Исключение участника ведущим через reply
     if update.message.from_user.id == game.host_id:
@@ -486,10 +557,11 @@ async def reply_on_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
 
             # Ищем автора по message_id
             author_id = None
-            for uid, pdata in game.photos_this_round.items():
-                if pdata != "REPEAT" and pdata["message_id"] == replied_id:
-                    author_id = uid
-                    break
+            for rnd, photos in game.photos_all_rounds.items():
+                for uid, pdata in photos.items():
+                    if pdata["message_id"] == reply_msg.message_id:
+                        author_id = uid
+                        break
 
             if not author_id:
                 await update.message.reply_text("☠️ Автор не найден.")
@@ -511,7 +583,6 @@ async def reply_on_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text(f"Автор: {author_text}")
             return
     
-
 # -------------------- ЗАВЕРШЕНИЕ РАУНДА --------------------
 async def end_round(game: Game, context: ContextTypes.DEFAULT_TYPE):
     if not game.round_active:
@@ -520,49 +591,46 @@ async def end_round(game: Game, context: ContextTypes.DEFAULT_TYPE):
             text=f"🏴 Раунд {game.current_round} уже завершён."
         )
         return
+    
+    # Открепляем сообщение раунда
+    try:
+        if game.pinned_message_id:
+            await context.bot.unpin_chat_message(
+                chat_id=MAIN_CHAT_ID,
+                message_id=game.pinned_message_id
+            )
+    except:
+        pass
 
     # Останавливаем приём фото
     game.round_active = False
 
-    # Сообщение ведущему
-    await context.bot.send_message(
-        chat_id=game.host_id,
-        text=f"🏴 Раунд {game.current_round} завершён."
-    )
+    # Сохраняем данные текущего раунда в общее хранилище
+    game.photos_all_rounds[game.current_round] = game.photos_this_round.copy()
 
-    # Автовыбывание за отсутствие фото
+    # Теперь можно очищать текущий раунд
+    game.photos_this_round.clear()
+
+    # Сообщение ведущему
+    await context.bot.send_message(chat_id=game.host_id, text=f"🏴 Раунд {game.current_round} завершён.")
+
+    # Автовыбывание участников за отсутствие фото
     for uid, pdata in game.participants.items():
-        if not pdata["eliminated"] and uid not in game.photos_this_round:
+        # Проверяем все предыдущие раунды
+        sent_rounds = [r for r, photos in game.photos_all_rounds.items() if uid in photos]
+        if not pdata["eliminated"] and game.current_round not in sent_rounds:
             if game.mode == "elimination":
                 pdata["eliminated"] = True
                 pdata["round_out"] = game.current_round
-
                 nickname = pdata["nickname"]
                 await context.bot.send_message(
-                    chat_id=MAIN_CHAT_ID,
+                    chat_id=game.chat_id,
                     message_thread_id=game.topic_id,
-                    text=(
-                        f"💤 @{nickname} выбывает за пропуск раунда {game.current_round} 💤"
-                        if game.show_eliminated_nicks else
-                        f"💤 Игрок выбывает за пропуск раунда {game.current_round} 💤"
-                    )
+                    text=f"💤 @{nickname} выбывает за пропуск раунда {game.current_round} 💤"
+                    if game.show_eliminated_nicks else f"💤 Игрок выбывает за пропуск раунда {game.current_round} 💤"
                 )
-                await context.bot.send_message(
-                    chat_id=uid,
-                    text=f"💤 Вы выбываете за пропуск раунда {game.current_round} 💤"
-                )
-
-    # Для тех, кого исключили вручную
-    for uid, pdata in game.participants.items():
-        if pdata.get("eliminated") and "round_out" not in pdata:
-            pdata["round_out"] = game.current_round
-
-    # Сообщение в тему
-    await context.bot.send_message(
-        chat_id=MAIN_CHAT_ID,
-        message_thread_id=game.topic_id,
-        text=f"🖇️ Раунд {game.current_round} завершён. Приём фото остановлен."
-    )
+                await context.bot.send_message(chat_id=uid,
+                                               text=f"💤 Вы выбываете за пропуск раунда {game.current_round} 💤")
 
 # -------------------- ЗАВЕРШЕНИЕ ИГРЫ --------------------
 def escape_markdown(text):
@@ -581,11 +649,11 @@ async def end_game(game: Game, context: ContextTypes.DEFAULT_TYPE):
             if not pdata["eliminated"] and user_id not in game.photos_this_round:
                 pdata["eliminated"] = True
                 pdata["round_out"] = game.current_round
-                nickname = pdata["nickname"]
+                display_name = f"@{pdata['username']}" if pdata.get("username") else pdata["nickname"]
                 await context.bot.send_message(
                     chat_id=game.chat_id,
                     message_thread_id=game.topic_id,
-                    text=f"💤 @{nickname} выбывает за пропуск раунда {game.current_round} 💤" 
+                    text=f"💤 {display_name} выбывает за пропуск раунда {game.current_round} 💤" 
                          if game.show_eliminated_nicks else f"💤 Игрок выбывает за пропуск раунда {game.current_round} 💤"
                 )
 
@@ -597,7 +665,8 @@ async def end_game(game: Game, context: ContextTypes.DEFAULT_TYPE):
         reverse=True
     )
     for pdata in sorted_participants:
-        line = f"@{escape_markdown(pdata['nickname'])} — {pdata['score']} б"
+        user_display = f"@{pdata['username']}" if pdata.get("username") else pdata["nickname"]
+        line = f"{escape_markdown(user_display)} — {pdata['score']} б"
         if pdata.get("eliminated"):
             line += f" ☠️ выбыл в раунде {pdata.get('round_out', '?')}"
         text_lines.append(line)
@@ -613,26 +682,26 @@ async def end_game(game: Game, context: ContextTypes.DEFAULT_TYPE):
     )
 
     # Отправка личных сообщений каждому участнику 
+    host_user = await context.bot.get_chat(game.host_id)
+    host_username = f"@{host_user.username}" if host_user.username else "Ведущий"
+
     for user_id, pdata in game.participants.items():
-        nickname = pdata["nickname"]
+        user_display = f"@{pdata['username']}" if pdata.get("username") else pdata["nickname"]
         score = pdata["score"]
         eliminated = pdata.get("eliminated", False)
         round_out = pdata.get("round_out")
-        host_username = game.participants.get(game.host_id, {}).get("username", "ведущий")
-        
-        text = "🏆 Игра завершена. "
+    
+        text = f"🏆 Игра завершена. "
 
         if game.mode == "elimination":
             if eliminated:
                 text += f"Вы выбыли в {round_out} раунде из {game.current_round} ☠️"
                 if score > 0:
                     text += f" Вы получили {score}б."
-                   
             else:
                 text += f"Вы дошли до финала в {game.current_round} раундах 🏅"
                 if score > 0:
                     text += f" Вы получили {score}б."
-                
         else:  # обычный режим
             if score == 0:
                 text += "К сожалению, вы не набрали баллов 🥲"
@@ -651,11 +720,10 @@ async def end_game(game: Game, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(chat_id=user_id, text=text)
         except Exception as e:
-            print(f"🤡 Не удалось отправить личное сообщение {nickname}: {e}")
+            print(f"🤡 Не удалось отправить личное сообщение {user_display}: {e}")
 
-
-        # Удаляем все данные о текущей игре
-        games.pop(game.host_id, None)
+    # Удаляем все данные о текущей игре
+    games.pop(game.host_id, None)
 
 # -------------------- ХЭНДЛЕР МЕНЮ ВЕДУЩЕГО --------------------
 async def host_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -684,24 +752,101 @@ async def host_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_round(game, context)
         await show_host_menu(game, context)
         return  # новое меню отправится в start_round
+    
+    # -------------------- УЧАСТНИК ХОЧЕТ ПОКИНУТЬ ИГРУ --------------------
+    if data.startswith("leave_"):
+        uid = int(data.split("_")[1])
+
+        keyboard = [
+            [InlineKeyboardButton("✅ Да, покинуть", callback_data=f"leave_confirm_{uid}")],
+            [InlineKeyboardButton("❌ Отмена", callback_data=f"leave_cancel_{uid}")]
+        ]
+
+        await query.edit_message_text(
+            "Вы уверены, что хотите покинуть игру?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    # -------------------- УЧАСТНИК ПОДТВЕРДИЛ ВЫХОД --------------------
+    if data.startswith("leave_confirm_"):
+        uid = int(data.split("_")[2])
+
+        if uid in game.participants:
+            game.participants[uid]["eliminated"] = True
+            game.participants[uid]["round_out"] = game.current_round
+
+        await query.edit_message_text("❌ Вы покинули игру добровольно в {game.current_round} раунде.")
+
+        await context.bot.send_message(
+            chat_id=MAIN_CHAT_ID,
+            message_thread_id=game.topic_id,
+            text=f"⚠️ Участник @{query.from_user.username} покинул игру добровольно в {game.current_round} раунде."
+        )
+        return
+
+    # -------------------- УЧАСТНИК ОТМЕНИЛ ВЫХОД --------------------
+    if data.startswith("leave_cancel_"):
+    
+        await query.edit_message_text(
+            "Вы остались в игре 💖"
+        )
+        return
 
     # -------------------- Завершение игры (подтверждение) --------------------
     if data == "host_end_game":
+    
+        # --- собираем участников и сортируем ---
+        scores_list = []
+        for pdata in game.participants.values():
+            scores_list.append({
+                "username": pdata.get("username"),
+                "nickname": pdata.get("nickname") or "Участник",
+                "score": pdata["score"]
+            })
+
+        # сортировка по убыванию баллов
+        scores_list.sort(key=lambda x: x["score"], reverse=True)
+
+        # --- распределяем по местам ---
+        places = {}      # {place_number: [players]}
+        current_place = 1
+        last_score = None
+
+        for player in scores_list:
+            score = player["score"]
+
+            if last_score is None:
+                # первый человек — первое место
+                places[current_place] = [player]
+                last_score = score
+            else:
+                if score == last_score:
+                    # такой же балл → то же место
+                    places[current_place].append(player)
+                else:
+                    # другой балл → следующее место
+                    current_place += 1
+                    places[current_place] = [player]
+                    last_score = score
+
+        # --- ищем места где >1 игрок (ничьи) ---
+        tied_places = [place for place, players in places.items() if len(players) > 1]
+
+        # формируем текст предупреждения
+        if tied_places:
+            places_text = ", ".join(str(p) for p in tied_places)
+            text = f"⚠️ Несколько победителей с одинаковыми баллами на {places_text} месте. Хотите завершить игру?"
+        else:
+            text = "Вы уверены, что хотите завершить игру?"
+
+        # --- кнопки ---
         keyboard = [
             [InlineKeyboardButton("✅ Подтвердить завершение", callback_data="host_force_end_game")],
             [InlineKeyboardButton("❌ Отменить", callback_data="host_cancel_end_game")]
         ]
-        scores = [pdata["score"] for pdata in game.participants.values()]
-        max_score = max(scores) if scores else 0
-        winners = [pdata for pdata in game.participants.values() if pdata["score"] == max_score and max_score > 0]
 
-        text = (
-            "⚠️ Несколько победителей с одинаковыми баллами. Хотите завершить игру?"
-            if len(winners) > 1 else
-            "Вы уверены, что хотите завершить игру?"
-        )
-
-        # редактируем текущее меню
+        # --- редактируем меню ---
         try:
             await context.bot.edit_message_text(
                 chat_id=game.host_id,
@@ -711,14 +856,29 @@ async def host_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except BadRequest as e:
             if "Message is not modified" in str(e):
-                pass  # игнорируем, всё ок
+                pass
             else:
-                print("Ошибка show_host_menu:", e)
+                print("Ошибка host_end_game:", e)
 
     # -------------------- Подтверждение завершения --------------------
     if data == "host_force_end_game":
+        # Завершаем текущий раунд, если он активен
+        if game.round_active:
+            await end_round(game, context)
+
         total_rounds = game.current_round or 0
         await end_game(game, context)
+
+        # Убираем меню у ведущего
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=user_id,
+                message_id=game.host_menu_message_id,
+                reply_markup=None
+            )
+        except BadRequest as e:
+            if "Message to edit not found" not in str(e):
+                print("Ошибка при удалении меню:", e)
 
         # Новое сообщение: игра окончена
         await context.bot.send_message(
@@ -744,59 +904,7 @@ async def host_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_game(fake_update, context)
         return
 
-# -------------------- КОМАНДА /host_menu --------------------
-async def host_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    user_id = update.message.from_user.id
-    game = next((g for g in games.values() if g.host_id == user_id), None)
-    if not game:
-        await update.message.reply_text("👀 Вы не ведущий ни одной игры.")
-        return
-    await show_host_menu(game, context)
-
-# -------------------- КОМАНДА /stop_round --------------------
-async def stop_round_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    user_id = update.message.from_user.id
-    game = next((g for g in games.values() if g.host_id == user_id), None)
-    if not game:
-        await update.message.reply_text("👀 Вы не ведущий ни одной игры.")
-        return
-    await end_round(game, context)
-    await update.message.reply_text(f"🏁 Раунд {game.current_round} завершен ведущим")
-
-# -------------------- КОМАНДА /restart_bot --------------------
-async def admin_restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
-    user_id = update.message.from_user.id
-    # список ID админов, которые могут использовать команду
-    allowed_admins = [123456789, 987654321]  
-
-    if user_id not in allowed_admins:
-        await update.message.reply_text("👀 У вас нет прав для этой команды.")
-        return
-
-    await update.message.reply_text("Бот перезапускается… ⚠️ Все текущие игры будут завершены!")
-    import os
-    import sys
-    os.execv(sys.executable, ['python3'] + sys.argv)
-
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-# -------------------- КОМАНДА /call_participants_public --------------------
-async def call_participants_public(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    user_id = update.message.from_user.id
-    game = next((g for g in games.values() if g.host_id == user_id), None)
-    if not game:
-        await update.message.reply_text("👀 Вы не ведущий ни одной игры.")
-        return
-
+async def _call_participants(game, context, public: bool):
     # Находим участников, которых нужно позвать
     to_call = []
     for uid, pdata in game.participants.items():
@@ -805,90 +913,306 @@ async def call_participants_public(update: Update, context: ContextTypes.DEFAULT
             to_call.append(uid)
 
     if not to_call:
-        await update.message.reply_text("Все участники уже прислали фото 💖")
-        return
+        return None, None  # никого нет
 
-    # Создаем сообщение в теме
+    # Формируем список упоминаний
     mentions = []
     for uid in to_call:
         pdata = game.participants[uid]
-        nickname = pdata.get("nickname") or "Участник"
         username = pdata.get("username")
+        nickname = pdata.get("nickname") or "Участник"
         mentions.append(f"@{username}" if username else nickname)
 
-    text_topic = f"🛎️ Участники не приславшие фото: {', '.join(mentions)}"
-    await context.bot.send_message(chat_id=MAIN_CHAT_ID, message_thread_id=game.topic_id, text=text_topic)
+    # Текст для темы
+    if public:
+        text_topic = f"🛎️ Участники не приславшие фото: {', '.join(mentions)}"
+    else:
+        text_topic = "🛎️ Участников позвали в ЛС 🛎️"
 
-    # Отправка ЛС участникам с кнопкой
+    # Сообщение в теме
+    await context.bot.send_message(
+        chat_id=MAIN_CHAT_ID,
+        message_thread_id=game.topic_id,
+        text=text_topic
+    )
+
+    # Кнопка для ЛС
+    keyboard = [
+    [InlineKeyboardButton("💖 Перейти в тему", url=f"https://t.me/c/{MAIN_CHAT_ID}/{game.topic_id}")],
+    [InlineKeyboardButton("🚪 Покинуть игру", callback_data=f"leave_{uid}")]
+    ]
+
+    # Отправляем ЛС
     for uid in to_call:
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💖 Перейти в чат игры", url=f"https://t.me/c/{str(MAIN_CHAT_ID)[4:]}/{game.topic_id}")]
-        ])
-        await context.bot.send_message(chat_id=uid, text="🛎️ Вас вызывает ведущий! 🛎️", reply_markup=keyboard)
+        await context.bot.send_message(
+            chat_id=uid,
+            text="🛎️ Вас вызывает ведущий! 🛎️",
+            reply_markup=keyboard
+        )
 
+    return to_call, mentions
 
-# -------------------- КОМАНДА /call_participants_private --------------------
+async def call_participants_public(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    user_id = update.message.from_user.id
+    game = next((g for g in games.values() if g.host_id == user_id), None)
+
+    if not game:
+        await update.message.reply_text("👀 Вы не ведущий ни одной игры.")
+        return
+
+    to_call, _ = await _call_participants(game, context, public=True)
+
+    if not to_call:
+        await update.message.reply_text("Все участники уже прислали фото 💖")
+
 async def call_participants_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
+
     user_id = update.message.from_user.id
+    game = next((g for g in games.values() if g.host_id == user_id), None)
+
+    if not game:
+        await update.message.reply_text("👀 Вы не ведущий ни одной игры.")
+        return
+
+    to_call, _ = await _call_participants(game, context, public=False)
+
+    if not to_call:
+        await update.message.reply_text("Все участники уже прислали фото 💖")
+
+# -------------------- КОМАНДА /check_photos --------------------
+async def check_photos_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    
+    user_id = update.message.from_user.id
+    # Ищем игру, где этот пользователь ведущий
     game = next((g for g in games.values() if g.host_id == user_id), None)
     if not game:
         await update.message.reply_text("👀 Вы не ведущий ни одной игры.")
         return
 
-    # Находим участников, которых нужно позвать
-    to_call = []
-    for uid, pdata in game.participants.items():
-        photo_status = game.photos_this_round.get(uid)
-        if not pdata.get("eliminated") and (photo_status is None or photo_status == "REPEAT"):
-            to_call.append(uid)
+    # Определяем thread_id, если команда в теме
+    thread_id = getattr(update.message, "message_thread_id", None)
+    topic_id = thread_id or game.topic_id
 
-    if not to_call:
-        await update.message.reply_text("Все участники уже прислали фото 💖")
+    total = len(game.participants)
+    not_sent = sum(
+        1 for uid, pdata in game.participants.items()
+        if not pdata.get("eliminated") and (game.photos_this_round.get(uid) is None or game.photos_this_round.get(uid) == "REPEAT")
+    )
+
+    # ЛС ведущему
+    await update.message.reply_text(f"Не прислали фото: {not_sent} из {total}")
+
+    # Сообщение в теме
+    await context.bot.send_message(
+        chat_id=MAIN_CHAT_ID,
+        message_thread_id=topic_id,
+        text=f"Еще ожидаются {not_sent} фото из {total}"
+    )
+
+#-------------------- КОМАНДА /show_results --------------------
+async def show_results(game, context):
+
+    # Собираем все баллы участников
+    scores = [pdata["score"] for pdata in game.participants.values()]
+
+    if not scores:
+        text = "Пока нет участников с баллами."
+        await context.bot.send_message(chat_id=game.host_id, text=text)
         return
 
-    # Сообщение в теме, без упоминаний
-    await context.bot.send_message(chat_id=MAIN_CHAT_ID, message_thread_id=game.topic_id,
-                                   text="🛎️ Участников позвали в ЛС 🛎️")
+    # Считаем количество участников с каждым баллом
+    score_counts = Counter(scores)
 
-    # Отправка ЛС участникам с кнопкой
-    for uid in to_call:
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💖 Перейти в чат и тему", url=f"https://t.me/c/{str(MAIN_CHAT_ID)[4:]}/{game.topic_id}")]
-        ])
-        await context.bot.send_message(chat_id=uid, text="🛎️ Вас вызывает ведущий! 🛎️", reply_markup=keyboard)
+    # Сортируем уникальные баллы по убыванию (чем больше балл, тем выше место)
+    sorted_scores = sorted(score_counts.keys(), reverse=True)
 
-# # --------------------  КОМАНДА /start --------------------
-# async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     welcome_text = (
-#         "🖤 Вас приветствует Крысиный Кутюр 🐀\n"
-#         "Место для анонимных переодевашек, где каждый остаётся в тени.\n"
-#         "👥 Участники: отправляйте фото и зарабатывайте очки — никто не узнает вашу личность.\n"
-#         "🎩 Ведущие: создайте раунд командой \n/start_game и ведите игру по своим правилам.\n"
-#         "Каждое фото — тайна, каждая оценка — шаг в неизвестное.\n"
-#         "Вступите в игру, где никто не знает, кто скрывается за маской… 🎭✨"
-#     )
-#     await update.message.reply_text(welcome_text)
+    place = 1
+    repeated_places = []
+
+    for score in sorted_scores:
+        count = score_counts[score]
+        if count > 1:
+            repeated_places.append(place)
+        place += count  # следующий "место" с учётом количества участников с этим баллом
+
+    if repeated_places:
+        places_text = ", ".join(str(p) for p in repeated_places)
+        text = f"⚠️ На {places_text} месте одинаковое количество баллов у участников."
+    else:
+        text = "Пока нет повторяющихся баллов на местах."
+
+    # Отправка ведущему в ЛС
+    await context.bot.send_message(chat_id=game.host_id, text=text)
+
+    # Отправка в тему
+    await context.bot.send_message(chat_id=MAIN_CHAT_ID, message_thread_id=game.topic_id, text=text)
+
+#-------------------- КОМАНДА /show_players --------------------
+async def show_players(update, context):
+    game = next(iter(games.values()), None)
+    if not game:
+        return
+
+    players = [
+        f"• {p['nickname']} ({p['score']}б)"
+        for uid, p in game.participants.items()
+        if not p["eliminated"]
+    ]
+
+    text = "Участники в игре:\n" + "\n".join(players)
+
+    # ведущему
+    await context.bot.send_message(chat_id=game.host_id, text=text)
+
+    # в тему
+    await context.bot.send_message(chat_id=MAIN_CHAT_ID, message_thread_id=game.topic_id, text=text)
 
 # -------------------- MAIN --------------------
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("start_game", start_game))
     app.add_handler(CallbackQueryHandler(host_menu_handler, pattern=r'^host_'))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, photo_handler))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Chat(MAIN_CHAT_ID) & filters.REPLY, reply_on_photo_handler))
-    app.add_handler(CommandHandler("host_menu", host_menu_command))
-    app.add_handler(CommandHandler("stop_game", stop_round_command))
-    app.add_handler(CommandHandler("restart_bot", admin_restart_command))
-    
-    app.add_handler(CommandHandler("call_participants_public", call_participants_public))
-    app.add_handler(CommandHandler("call_participants_private", call_participants_private))
+    app.add_handler(MessageHandler((filters.REPLY) & (filters.TEXT | filters.CAPTION),reply_on_photo_handler))
+    app.add_handler(CommandHandler("call_public", call_participants_public))
+    app.add_handler(CommandHandler("call_private", call_participants_private))
+    app.add_handler(CommandHandler("check_photos_handler", check_photos_handler))
+    app.add_handler(CommandHandler("check_photos", check_photos_handler))
+    app.add_handler(CommandHandler("show_results", show_results))
+    app.add_handler(CommandHandler("show_players", show_players))
+
+
 
     print("Bot is running...")
     app.run_polling()
 
 
+# # -------------------- КОМАНДА /host_menu --------------------
+# async def host_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     if not update.message:
+#         return
+#     user_id = update.message.from_user.id
+#     game = next((g for g in games.values() if g.host_id == user_id), None)
+#     if not game:
+#         await update.message.reply_text("👀 Вы не ведущий ни одной игры.")
+#         return
+#     await show_host_menu(game, context)
+
+# # -------------------- КОМАНДА /stop_round --------------------
+# async def stop_round_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     if not update.message:
+#         return
+#     user_id = update.message.from_user.id
+#     game = next((g for g in games.values() if g.host_id == user_id), None)
+#     if not game:
+#         await update.message.reply_text("👀 Вы не ведущий ни одной игры.")
+#         return
+#     await end_round(game, context)
+#     await update.message.reply_text(f"🏁 Раунд {game.current_round} завершен ведущим")
+
+# # -------------------- КОМАНДА /restart_bot --------------------
+# async def admin_restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     if not update.message:
+#         return
+
+#     user_id = update.message.from_user.id
+#     # список ID админов, которые могут использовать команду
+#     allowed_admins = [123456789, 987654321]  
+
+#     if user_id not in allowed_admins:
+#         await update.message.reply_text("👀 У вас нет прав для этой команды.")
+#         return
+
+#     await update.message.reply_text("Бот перезапускается… ⚠️ Все текущие игры будут завершены!")
+#     import os
+#     import sys
+#     os.execv(sys.executable, ['python3'] + sys.argv)
+
+
+# # -------------------- КОМАНДА /call_participants_public --------------------
+# async def call_participants_public(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     if not update.message:
+#         return
+#     user_id = update.message.from_user.id
+#     game = next((g for g in games.values() if g.host_id == user_id), None)
+#     if not game:
+#         await update.message.reply_text("👀 Вы не ведущий ни одной игры.")
+#         return
+
+#     # Находим участников, которых нужно позвать
+#     to_call = []
+#     for uid, pdata in game.participants.items():
+#         photo_status = game.photos_this_round.get(uid)
+#         if not pdata.get("eliminated") and (photo_status is None or photo_status == "REPEAT"):
+#             to_call.append(uid)
+
+#     if not to_call:
+#         await update.message.reply_text("Все участники уже прислали фото 💖")
+#         return
+
+#     # Создаем сообщение в теме
+#     mentions = []
+#     for uid in to_call:
+#         pdata = game.participants[uid]
+#         nickname = pdata.get("nickname") or "Участник"
+#         username = pdata.get("username")
+#         mentions.append(f"@{username}" if username else nickname)
+
+#     text_topic = f"🛎️ Участники не приславшие фото: {', '.join(mentions)}"
+#     await context.bot.send_message(chat_id=MAIN_CHAT_ID, message_thread_id=game.topic_id, text=text_topic)
+
+#     # Отправка ЛС участникам с кнопкой
+#     for uid in to_call:
+#         keyboard = InlineKeyboardMarkup([
+#             [InlineKeyboardButton("💖 Перейти в чат игры", url=f"https://t.me/c/{str(MAIN_CHAT_ID)[4:]}/{game.topic_id}")]
+#         ])
+#         await context.bot.send_message(chat_id=uid, text="🛎️ Вас вызывает ведущий! 🛎️", reply_markup=keyboard)
+
+
+# # -------------------- КОМАНДА /call_participants_private --------------------
+# async def call_participants_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     if not update.message:
+#         return
+#     user_id = update.message.from_user.id
+#     game = next((g for g in games.values() if g.host_id == user_id), None)
+#     if not game:
+#         await update.message.reply_text("👀 Вы не ведущий ни одной игры.")
+#         return
+
+#     # Находим участников, которых нужно позвать
+#     to_call = []
+#     for uid, pdata in game.participants.items():
+#         photo_status = game.photos_this_round.get(uid)
+#         if not pdata.get("eliminated") and (photo_status is None or photo_status == "REPEAT"):
+#             to_call.append(uid)
+
+#     if not to_call:
+#         await update.message.reply_text("Все участники уже прислали фото 💖")
+#         return
+
+#     # Сообщение в теме, без упоминаний
+#     await context.bot.send_message(chat_id=MAIN_CHAT_ID, message_thread_id=game.topic_id,
+#                                    text="🛎️ Участников позвали в ЛС 🛎️")
+
+#     # Отправка ЛС участникам с кнопкой
+#     for uid in to_call:
+#         keyboard = InlineKeyboardMarkup([
+#             [InlineKeyboardButton("💖 Перейти в чат и тему", url=f"https://t.me/c/{str(MAIN_CHAT_ID)[4:]}/{game.topic_id}")]
+#         ])
+#         await context.bot.send_message(chat_id=uid, text="🛎️ Вас вызывает ведущий! 🛎️", reply_markup=keyboard)
+
+
+
+    # app.add_handler(CommandHandler("start", start_command))
+    # app.add_handler(CommandHandler("host_menu", host_menu_command))
+    # app.add_handler(CommandHandler("stop_game", stop_round_command))
+    # app.add_handler(CommandHandler("restart_bot", admin_restart_command))
