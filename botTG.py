@@ -465,7 +465,7 @@ async def start_round(game: Game, context: ContextTypes.DEFAULT_TYPE):
 
 # -------------------- ОБРАБОТКА ФОТО --------------------
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not getattr(update, "message", None):
+    if not update.message:
         return
 
     user = update.message.from_user
@@ -473,12 +473,20 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_file_id = update.message.photo[-1].file_id
     participant_caption = f"\n\n💬 {update.message.caption}" if update.message.caption else ""
 
-    # Получаем текущую игру
-    game = next(
-        (g for g in games.values() if g.host_id == user_id),
-        None
-    )
-    if not game or not getattr(game, "started", False):
+    # 🔑 ИЩЕМ АКТИВНУЮ ИГРУ
+    game = next((g for g in games.values() if g.started), None)
+
+    if not game:
+        await update.message.reply_text("👀 Игра ещё не запущена ведущим.")
+        return
+
+    # ⏳ ждём реф
+    if game.ref_mode and not game.current_ref_sent:
+        if user_id != game.host_id:
+            await update.message.reply_text("⏳ Ожидаем реф от ведущего.")
+            return
+
+    if not game:
         await update.message.reply_text("👀 Игра ещё не запущена ведущим.")
         return
 
@@ -657,7 +665,10 @@ async def reply_on_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
     if not update.message or not update.message.reply_to_message or not update.message.text:
         return
 
-    game = next(iter(games.values()), None)
+    game = next(
+        (g for g in games.values() if getattr(g, "started", False)),
+        None
+    )
     if not game:
         return
 
