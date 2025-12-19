@@ -474,7 +474,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     participant_caption = f"\n\n💬 {update.message.caption}" if update.message.caption else ""
 
     # Получаем текущую игру
-    game = next(iter(games.values()), None)
+    game = next(
+        (g for g in games.values() if g.host_id == user_id),
+        None
+    )
     if not game or not getattr(game, "started", False):
         await update.message.reply_text("👀 Игра ещё не запущена ведущим.")
         return
