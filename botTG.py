@@ -486,9 +486,6 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⏳ Ожидаем реф от ведущего.")
             return
 
-    if not game:
-        await update.message.reply_text("👀 Игра ещё не запущена ведущим.")
-        return
 
     # --- ВЕДУЩИЙ ОТПРАВЛЯЕТ РЕФ ---
     if game.ref_mode and user_id == game.host_id:
@@ -1277,9 +1274,10 @@ async def check_photos_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 #-------------------- КОМАНДА /show_players --------------------
 async def show_players(update, context):
-    game = next(iter(games.values()), None)
+    game = next((g for g in games.values() if g.started), None)
     if not game:
         return
+
 
     players = [
         f"• @{p['username']}" if p.get("username") else f"• {p.get('nickname', 'Без ника')}"
