@@ -180,26 +180,39 @@ async def ask_participant_limit(query):
     await query.edit_message_text("Выберите ограничение участников:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def set_jury_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ловит юзернейм второго судьи"""
     user_id = update.effective_user.id
-    if user_id not in games: return
-
-    game = games[user_id]
+    # Ищем игру, где этот пользователь является ведущим
+    game = games.get(user_id)
     
-    # Если мы не ждем ввода ника — выходим
-    if not game.waiting_for_cohost_input:
+    if not game or not getattr(game, 'waiting_for_cohost_input', False):
         return
 
     username = update.message.text.strip().replace("@", "")
     
     if len(username) < 4:
-        await update.message.reply_text("⚠️ Слишком короткий юзернейм.")
+        await update.message.reply_text("⚠️ Слишком короткий юзернейм. Введите еще раз:")
         return
 
     game.co_host_username = username
-    game.waiting_for_cohost_input = False # Больше не ждем
+    game.waiting_for_cohost_input = False # Выключаем режим ожидания текста
 
-    await update.message.reply_text(f"✅ Второй судья добавлен: @{username}\nТеперь нажмите 'Добавить жюри' еще раз или начинайте игру.")
+    await update.message.reply_text(f"✅ Второй судья добавлен: @{username}")
+    
+    text = game_settings_text(game)
+    
+    jury_label = f"👮‍♂️ Жюри: @{game.co_host_username} (Изм.)"
+    
+    keyboard = [
+        [InlineKeyboardButton(jury_label, callback_data="add_jury")],
+        [InlineKeyboardButton("🚀 Начать игру", callback_data="start_confirm")],
+        [InlineKeyboardButton("🗑️ Сбросить", callback_data="start_reset")]
+    ]
+    
+    await update.message.reply_text(
+        text, 
+        parse_mode="Markdown", 
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def confirm_game_settings(query, game):
     text = game_settings_text(game)
@@ -422,6 +435,7 @@ async def start_game_with_ref(game, context):
 
 async def actually_start_round_after_ref(game, context, caption):
     game.round_active = True
+    game.photo_reception_active = True
     game.reset_round()
 
     text = f"🔥 Раунд {game.current_round} начался!"
@@ -466,8 +480,9 @@ async def start_round(game: Game, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=game.host_id, text=f"Раунд {game.current_round} уже идет.")
         return
 
+    game.round_active = True
+    game.photo_reception_active = True
     game.reset_round()
-    
 
     # Сообщение ведущему
     await context.bot.send_message(
@@ -505,177 +520,153 @@ async def start_round(game: Game, context: ContextTypes.DEFAULT_TYPE):
     await notify_round_start(game, context)
 
 # -------------------- ОБРАБОТКА ФОТО --------------------
-async def reply_on_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.reply_to_message or not update.message.text:
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
         return
 
-    # Ищем активную игру
-    game = next(
-        (g for g in games.values() if getattr(g, "started", False)),
-        None
-    )
-    if not game:
-        return
-
-    # --- ПОЛУЧАЕМ ID ТОГО, КТО ПИШЕТ (СУДЬЯ ИЛИ ВЕДУЩИЙ) ---
     user = update.message.from_user
-    user_id = user.id  # <--- ВОТ ЭТО ВАЖНО (ОБЪЯВЛЯЕМ ПЕРЕМЕННУЮ)
-    
-    is_host = (user_id == game.host_id)
-    is_jury = False
+    user_id = user.id
+    photo_file_id = update.message.photo[-1].file_id
+    participant_caption = f"\n\n💬 {update.message.caption}" if update.message.caption else ""
 
-    # Проверяем юзернейм второго судьи
-    if game.co_host_username and user.username:
-        if user.username.lower() == game.co_host_username.lower():
-            is_jury = True
+    # 🔑 ИЩЕМ АКТИВНУЮ ИГРУ
+    game = next((g for g in games.values() if g.started), None)
 
-    # Если пишет не ведущий и не жюри — игнорируем
-    if not is_host and not is_jury:
+    if not game:
+        await update.message.reply_text("👀 Игра ещё не запущена ведущим.")
         return
 
-    # Имя для сообщений
-    judge_name = "Ведущий" if is_host else f"Жюри {user.first_name}"
-    # -------------------------------------------------------
-
-    reply_msg = update.message.reply_to_message
-    text = update.message.text.strip().lower()
-    replied_id = reply_msg.message_id
-
-    # ------------------- ИЩЕМ АВТОРА ФОТО -------------------
-    author_id = None
-    round_found = None
-
-    # 1. Текущий раунд
-    for uid, pdata in game.photos_this_round.items():
-        if pdata != "REPEAT" and pdata["message_id"] == replied_id:
-            author_id = uid
-            round_found = game.current_round
-            break
-
-    # 2. Прошлые раунды
-    if not author_id:
-        for rnd, photos in game.photos_all_rounds.items():
-            for uid, pdata in photos.items():
-                if pdata != "REPEAT" and pdata.get("message_id") == replied_id:
-                    author_id = uid
-                    round_found = rnd
-                    break
-            if author_id:
-                break
-
-    if not author_id:
-        return # Не нашли автора
-
-    pdata = game.participants.get(author_id)
-    if not pdata:
-        return
-
-    # ==========================================================
-    # КОМАНДЫ
-    # ==========================================================
-
-    # ------ КТО АВТОР ------
-    if text in ["кто автор", "автор", "автор?"]:
-        username = pdata.get("username")
-        nickname = pdata.get("nickname")
-        author_text = f"@{username}" if username else nickname or "🤫 секретик 🤫"
-        await update.message.reply_text(f"👤 {judge_name} спрашивает автора.\nЭто: {author_text}")
-        return
-
-    # ------ ВЫЛЕТ ------
-    if any(word in text for word in ELIMINATION_WORDS):
-        if pdata.get("eliminated"):
-            await update.message.reply_text("Игрок уже выбыл.")
+    # ⏳ ждём реф
+    if game.ref_mode and not game.current_ref_sent:
+        if user_id != game.host_id:
+            await update.message.reply_text("⏳ Ожидаем реф от ведущего.")
             return
 
-        round_found = game.current_round
-        pdata["eliminated"] = True
-        pdata["round_out"] = round_found
-        nickname = pdata["nickname"]
-        
-        text_out = f"🤝 {judge_name} исключил игрока @{nickname} в {round_found} раунде." if game.show_eliminated_nicks else f"🤝 Игрок выбывает из игры в {round_found} раунде (решение: {judge_name})."
-        
-        await context.bot.send_message(chat_id=MAIN_CHAT_ID, message_thread_id=game.topic_id, text=text_out)
-        try:
-            await context.bot.send_message(chat_id=author_id, text=f"🤝 {judge_name} исключил вас из игры в {round_found} раунде.")
-        except: pass
-        return
 
-    # ------ БАЛЛЫ (ТОЛЬКО ТЕКУЩИЙ РАУНД) ------
-    if round_found == game.current_round:
-        
-        # Начисление (+5б)
-        if text.startswith("+") and text.endswith("б"):
-            number_part = text[1:-1]
-            if number_part.isdigit():
-                if game.photos_this_round[author_id] == "REPEAT":
-                    await update.message.reply_text("✖️ Фото не участвует в раунде, его нельзя оценивать. ✖️")
-                    return
-                
-                points = int(number_part)
-                pdata["score"] += points
+    # --- ВЕДУЩИЙ ОТПРАВЛЯЕТ РЕФ ---
+    if game.ref_mode and user_id == game.host_id:
+        if not game.current_ref_sent:
+            game.current_ref_sent = True
+            game.round_active = True
 
-                # --- ИСТОРИЯ ОЦЕНОК (КТО ДАЛ) ---
-                if "detailed_scores" not in pdata: pdata["detailed_scores"] = {}
-                
-                # Используем user_id (ID судьи), а не author_id/uid (ID игрока)
-                judge_key = user_id 
-                
-                if judge_key in pdata["detailed_scores"]:
-                    pdata["detailed_scores"][judge_key]["points"] += points
-                else:
-                    pdata["detailed_scores"][judge_key] = {"name": judge_name, "points": points}
-                # --------------------------------
+            if game.current_round == 0:
+                game.current_round = 1
 
-                nickname_display = f"@{pdata['nickname']}" if game.show_nicks else "автору"
-                await update.message.reply_text(f"💸 {judge_name} начислил(а) {nickname_display} {points}б.")
-                
-                try:
-                    await context.bot.send_message(chat_id=author_id, text=f"💸 {judge_name} начислил(а) вам {points}б. Общая сумма: {pdata['score']}б.")
-                except: pass
-                return
+            # Публикуем реф в теме
+            text = f"🔥 Раунд {game.current_round} начался!{participant_caption}\n\n📩 Присылайте фото в ЛС бота!"
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💌 Прислать фото", url=f"https://t.me/{BOT_USERNAME[1:]}")]
+            ])
 
-        # Снятие (-5б)
-        if text.startswith("-") and text.endswith("б"):
-            num = text[1:-1]
-            if num.isdigit():
-                points = int(num)
-                pdata["score"] -= points
-                
-                if "detailed_scores" not in pdata: pdata["detailed_scores"] = {}
-                judge_key = user_id # ID судьи
-                
-                if judge_key in pdata["detailed_scores"]:
-                    pdata["detailed_scores"][judge_key]["points"] -= points
-                else:
-                    pdata["detailed_scores"][judge_key] = {"name": judge_name, "points": -points}
-
-                await update.message.reply_text(f"💸 {judge_name} снял(а) {points}б.")
-                try:
-                    await context.bot.send_message(
-                        chat_id=author_id,
-                        text=f"📉 {judge_name} снял(а) у вас {points}б. Общая сумма: {pdata['score']}б."
-                    )
-                except: pass
-                return
-
-        # Повторка фото
-        if text in ["повтори", "повтор", "повторка"]:
-            game.photos_this_round[author_id] = "REPEAT"
             try:
-                await context.bot.edit_message_caption(
+                ref_msg = await context.bot.send_photo(
                     chat_id=MAIN_CHAT_ID,
-                    message_id=reply_msg.message_id,
-                    caption=f"⛔️ ПОВТОР (от {judge_name}) ⛔️"
+                    message_thread_id=game.topic_id,
+                    photo=photo_file_id,
+                    caption=text,
+                    reply_markup=keyboard
                 )
-            except: pass
-            
-            await update.message.reply_text(f"⛔️ {judge_name} отправил фото на повтор.")
-            try:
-                await context.bot.send_message(chat_id=author_id, text=f"⛔️ {judge_name} отклонил ваше фото (Повтор). Отправьте новое!")
-            except: pass
+                game.last_round_message_id = ref_msg.message_id
+
+                # Закрепляем сообщение
+                try:
+                    await context.bot.pin_chat_message(
+                        chat_id=MAIN_CHAT_ID,
+                        message_id=ref_msg.message_id,
+                        disable_notification=True
+                    )
+                except Exception as e:
+                    print(f"Ошибка закрепления сообщения: {e}")
+
+                # Ведущему
+                await context.bot.send_message(
+                    chat_id=game.host_id,
+                    text=f"🎉 Реф принят! Раунд {game.current_round} стартовал."
+                )
+
+                await show_host_menu(game, context)
+
+            except telegram.error.NetworkError as e:
+                print(f"Не удалось отправить реф: {e}")
+                await update.message.reply_text("⚠️ Сеть недоступна. Попробуйте позже.")
+        else:
+            await update.message.reply_text("📌 Реф на этот раунд уже отправлен.")
+        return
+
+    # --- ФОТО УЧАСТНИКА ---
+    if not game.round_active:
+        await update.message.reply_text("👀 Сейчас нет активного раунда.")
+        return
+    
+    if not getattr(game, "photo_reception_active", True):
+        await update.message.reply_text("🔒 Приём фото для этого раунда остановлен.")
+        return
+
+    is_first_round = game.current_round == 1
+    user_in_game = user_id in game.participants
+    can_join = is_first_round or game.can_join_late
+
+    if not user_in_game and not can_join:
+        await update.message.reply_text("👀 Вы не можете присоединиться к игре. Она уже стартовала без вас.")
+        return
+
+    if not user_in_game and game.participant_limit and len(game.participants) >= game.participant_limit:
+        await update.message.reply_text("👀 Лимит участников достигнут. Вы не можете присоединиться.")
+        return
+
+    if user_in_game and game.participants[user_id]["eliminated"]:
+        await update.message.reply_text("👀 Вы выбыли и не можете участвовать в этом раунде.")
+        return
+
+    if user_in_game and user_id in game.photos_this_round:
+        if game.photos_this_round[user_id] != "REPEAT":
+            await update.message.reply_text("📮 Вы уже отправили фото в этом раунде.")
             return
-        
+
+    if not user_in_game:
+        game.participants[user_id] = {
+            "nickname": user.full_name,
+            "username": user.username,
+            "score": 0,
+            "eliminated": False,
+            "rounds_played": []
+        }
+
+    # Формируем подпись для фото с учётом номера и подписи
+    photo_number = len([p for p in game.photos_this_round.values() if p != "REPEAT"]) + 1
+    caption_text = f"📸 Фото #{photo_number} (Раунд {game.current_round}){participant_caption}"
+
+    try:
+        sent_msg = await context.bot.send_photo(
+            chat_id=MAIN_CHAT_ID,
+            message_thread_id=game.topic_id,
+            photo=photo_file_id,
+            caption=caption_text
+        )
+    except telegram.error.NetworkError as e:
+        print(f"Не удалось отправить фото участника: {e}")
+        await update.message.reply_text("⚠️ Сеть недоступна. Попробуйте позже.")
+        return
+
+    # Сохраняем данные о фото
+    game.photos_this_round[user_id] = {
+        "file_id": photo_file_id,
+        "message_id": sent_msg.message_id,
+        "caption": update.message.caption or ""
+    }
+
+    game.participants[user_id]["rounds_played"].append(game.current_round)
+
+    if game.current_round not in game.photos_all_rounds:
+        game.photos_all_rounds[game.current_round] = {}
+    game.photos_all_rounds[game.current_round][user_id] = {
+        "file_id": photo_file_id,
+        "message_id": sent_msg.message_id,
+        "caption": update.message.caption or ""
+    }
+
+    await update.message.reply_text("Фото принято ♥️") 
+
 async def handle_ref_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     game = context.user_data.get("game")
@@ -721,115 +712,284 @@ async def handle_ref_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # после публикации → запускаем раунд
     await actually_start_round_after_ref(game, context, caption)
-    
+
 # -------------------- ОБРАБОТКА ОТВЕТА НА ФОТО --------------------
+# async def reply_on_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     if not update.message or not update.message.reply_to_message or not update.message.text:
+#         return
+
+#     # Ищем активную игру
+#     game = next(
+#         (g for g in games.values() if getattr(g, "started", False)),
+#         None
+#     )
+#     if not game:
+#         return
+
+#     # --- ПОЛУЧАЕМ ID ТОГО, КТО ПИШЕТ (СУДЬЯ ИЛИ ВЕДУЩИЙ) ---
+#     user = update.message.from_user
+#     user_id = user.id  # <--- ВОТ ЭТО ВАЖНО (ОБЪЯВЛЯЕМ ПЕРЕМЕННУЮ)
+    
+#     is_host = (user_id == game.host_id)
+#     is_jury = (game.co_host_username and user.username and user.username.lower() == game.co_host_username.lower())
+
+#     if not is_host and not is_jury: return
+
+#     # Проверяем юзернейм второго судьи
+#     if game.co_host_username and user.username:
+#         if user.username.lower() == game.co_host_username.lower():
+#             is_jury = True
+
+#     # Если пишет не ведущий и не жюри — игнорируем
+#     if not is_host and not is_jury:
+#         return
+
+#     # Имя для сообщений
+#     judge_name = "Ведущий" if is_host else f"Жюри {user.first_name}"
+#     # -------------------------------------------------------
+
+#     reply_msg = update.message.reply_to_message
+#     text = update.message.text.strip().lower()
+#     replied_id = reply_msg.message_id
+
+#     # ------------------- ИЩЕМ АВТОРА ФОТО -------------------
+#     author_id = None
+#     round_found = None
+
+#     # 1. Текущий раунд
+#     for uid, pdata in game.photos_this_round.items():
+#         if pdata != "REPEAT" and pdata["message_id"] == replied_id:
+#             author_id = uid
+#             round_found = game.current_round
+#             break
+
+#     # 2. Прошлые раунды
+#     if not author_id:
+#         for rnd, photos in game.photos_all_rounds.items():
+#             for uid, pdata in photos.items():
+#                 if pdata != "REPEAT" and pdata.get("message_id") == replied_id:
+#                     author_id = uid
+#                     round_found = rnd
+#                     break
+#             if author_id:
+#                 break
+
+#     if not author_id:
+#         return # Не нашли автора
+
+#     pdata = game.participants.get(author_id)
+#     if not pdata:
+#         return
+
+#     # ==========================================================
+#     # КОМАНДЫ
+#     # ==========================================================
+
+#     # ------ КТО АВТОР ------
+#     if text in ["кто автор", "автор", "автор?"]:
+#         username = pdata.get("username")
+#         nickname = pdata.get("nickname")
+#         author_text = f"@{username}" if username else nickname or "🤫 секретик 🤫"
+#         await update.message.reply_text(f"👤 {judge_name} спрашивает автора.\nЭто: {author_text}")
+#         return
+
+#     # ------ ВЫЛЕТ ------
+#     if any(word in text for word in ELIMINATION_WORDS):
+#         if pdata.get("eliminated"):
+#             await update.message.reply_text("Игрок уже выбыл.")
+#             return
+
+#         round_found = game.current_round
+#         pdata["eliminated"] = True
+#         pdata["round_out"] = round_found
+#         nickname = pdata["nickname"]
+        
+#         text_out = f"🤝 {judge_name} исключил игрока @{nickname} в {round_found} раунде." if game.show_eliminated_nicks else f"🤝 Игрок выбывает из игры в {round_found} раунде (решение: {judge_name})."
+        
+#         await context.bot.send_message(chat_id=MAIN_CHAT_ID, message_thread_id=game.topic_id, text=text_out)
+#         try:
+#             await context.bot.send_message(chat_id=author_id, text=f"🤝 {judge_name} исключил вас из игры в {round_found} раунде.")
+#         except: pass
+#         return
+
+#     # ------ БАЛЛЫ (ТОЛЬКО ТЕКУЩИЙ РАУНД) ------
+#     if round_found == game.current_round:
+        
+#         # Начисление (+5б)
+#         if text.startswith("+") and text.endswith("б"):
+#             number_part = text[1:-1]
+#             if number_part.isdigit():
+#                 if game.photos_this_round[author_id] == "REPEAT":
+#                     await update.message.reply_text("✖️ Фото не участвует в раунде, его нельзя оценивать. ✖️")
+#                     return
+                
+#                 points = int(number_part)
+#                 pdata["score"] += points
+
+#                 # --- ИСТОРИЯ ОЦЕНОК (КТО ДАЛ) ---
+#                 if "detailed_scores" not in pdata: pdata["detailed_scores"] = {}
+                
+#                 # Используем user_id (ID судьи), а не author_id/uid (ID игрока)
+#                 judge_key = user_id 
+                
+#                 if judge_key in pdata["detailed_scores"]:
+#                     pdata["detailed_scores"][judge_key]["points"] += points
+#                 else:
+#                     pdata["detailed_scores"][judge_key] = {"name": judge_name, "points": points}
+#                 # --------------------------------
+
+#                 nickname_display = f"@{pdata['nickname']}" if game.show_nicks else "автору"
+#                 await update.message.reply_text(f"💸 {judge_name} начислил(а) {nickname_display} {points}б.")
+                
+#                 try:
+#                     await context.bot.send_message(chat_id=author_id, text=f"💸 {judge_name} начислил(а) вам {points}б. Общая сумма: {pdata['score']}б.")
+#                 except: pass
+#                 return
+
+#         # Снятие (-5б)
+#         if text.startswith("-") and text.endswith("б"):
+#             num = text[1:-1]
+#             if num.isdigit():
+#                 points = int(num)
+#                 pdata["score"] -= points
+                
+#                 if "detailed_scores" not in pdata: pdata["detailed_scores"] = {}
+#                 judge_key = user_id # ID судьи
+                
+#                 if judge_key in pdata["detailed_scores"]:
+#                     pdata["detailed_scores"][judge_key]["points"] -= points
+#                 else:
+#                     pdata["detailed_scores"][judge_key] = {"name": judge_name, "points": -points}
+
+#                 await update.message.reply_text(f"💸 {judge_name} снял(а) {points}б.")
+#                 try:
+#                     await context.bot.send_message(
+#                         chat_id=author_id,
+#                         text=f"📉 {judge_name} снял(а) у вас {points}б. Общая сумма: {pdata['score']}б."
+#                     )
+#                 except: pass
+#                 return
+
+#         # Повторка фото
+#         if text in ["повтори", "повтор", "повторка"]:
+#             game.photos_this_round[author_id] = "REPEAT"
+#             try:
+#                 await context.bot.edit_message_caption(
+#                     chat_id=MAIN_CHAT_ID,
+#                     message_id=reply_msg.message_id,
+#                     caption=f"⛔️ ПОВТОР (от {judge_name}) ⛔️"
+#                 )
+#             except: pass
+            
+#             await update.message.reply_text(f"⛔️ {judge_name} отправил фото на повтор.")
+#             try:
+#                 await context.bot.send_message(chat_id=author_id, text=f"⛔️ {judge_name} отклонил ваше фото (Повтор). Отправьте новое!")
+#             except: pass
+#             return
+           
 async def reply_on_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.reply_to_message or not update.message.text:
         return
 
-    game = next(
-        (g for g in games.values() if getattr(g, "started", False)),
-        None
-    )
-    if not game:
-        return
+    game = next((g for g in games.values() if getattr(g, "started", False)), None)
+    if not game: return
+
+    user = update.message.from_user
+    user_id = user.id
+    
+    is_host = (user_id == game.host_id)
+    is_jury = (game.co_host_username and user.username and user.username.lower() == game.co_host_username.lower())
+
+    if not is_host and not is_jury: return
+
+    # Имя судьи (именно оно пойдет в итоговую таблицу)
+    judge_name = user.first_name if not is_host else "Ведущего"
 
     reply_msg = update.message.reply_to_message
     text = update.message.text.strip().lower()
-
     replied_id = reply_msg.message_id
 
-    # ------------------- НАХОДИМ АВТОРА ВО ВСЕХ РАУНДАХ -------------------
     author_id = None
     round_found = None
 
-    # Сначала текущий раунд
-    for uid, pdata in game.photos_this_round.items():
-        if pdata != "REPEAT" and pdata["message_id"] == replied_id:
-            author_id = uid
-            round_found = game.current_round
-            break
-
-    # Если не нашли, ищем в прошлых раундах
+    for uid, data in game.photos_this_round.items():
+        if data != "REPEAT" and isinstance(data, dict) and data.get("message_id") == replied_id:
+            author_id = uid; round_found = game.current_round; break
+            
     if not author_id:
-        for rnd, photos in game.photos_all_rounds.items():
-            for uid, pdata in photos.items():
-                if pdata != "REPEAT" and pdata.get("message_id") == replied_id:
-                    author_id = uid
-                    round_found = rnd
-                    break
-            if author_id:
-                break
+        for r_num, r_photos in game.photos_all_rounds.items():
+            for uid, data in r_photos.items():
+                if data != "REPEAT" and isinstance(data, dict) and data.get("message_id") == replied_id:
+                    author_id = uid; round_found = r_num; break
+            if author_id: break
 
-    if not author_id:
-        # Не нашли автора ни в одном раунде
-        return
-
+    if not author_id: return
     pdata = game.participants.get(author_id)
-    if not pdata:
+    if not pdata: return
+
+    # --- КОМАНДЫ ---
+
+    if text in ["кто автор", "автор", "автор?"]:
+        username = pdata.get("username")
+        nickname = pdata.get("nickname")
+        author_text = f"@{username}" if username else nickname or "🤫 секретик 🤫"
+        await update.message.reply_text(f"👤 {judge_name} спрашивает автора.\nЭто: {author_text}")
         return
 
-    # ------------------- КОМАНДЫ ВЕДУЩЕГО -------------------
-    if update.message.from_user.id == game.host_id:
-
-        # ------ КТО АВТОР ------
-        if text in ["кто автор", "автор", "автор?"]:
-            username = pdata.get("username")
-            nickname = pdata.get("nickname")
-            author_text = f"@{username}" if username else nickname or "🤫 секретик 🤫"
-            await update.message.reply_text(f"Автор: {author_text}")
-            return
-
-        # ------ ВЫЛЕТ ------
-        if any(word in text for word in ELIMINATION_WORDS):
-            round_found = game.current_round  # или можно передавать нужный раунд вручную
+    if any(word in text for word in ELIMINATION_WORDS):
+        if is_host: # Удаляет только ГЛАВНЫЙ ведущий
+            if pdata.get("eliminated"):
+                await update.message.reply_text("Этот игрок уже выбыл.")
+                return
             pdata["eliminated"] = True
             pdata["round_out"] = round_found
             nickname = pdata["nickname"]
             text_out = f"🤝 Игрок @{nickname} выбывает из игры в {round_found} раунде." if game.show_eliminated_nicks else f"🤝 Игрок выбывает из игры в {round_found} раунде."
             await context.bot.send_message(chat_id=MAIN_CHAT_ID, message_thread_id=game.topic_id, text=text_out)
-            await context.bot.send_message(chat_id=author_id, text=f"🤝 Вы выбываете из игры в {round_found} раунде.")
-            return
+            try: await context.bot.send_message(chat_id=author_id, text=f"🤝 Ведущий исключил вас из игры в раунде {round_found}.")
+            except: pass
+        return
 
-        # ------ НАЧИСЛЕНИЕ/СНЯТИЕ БАЛЛОВ (ТОЛЬКО ТЕКУЩИЙ РАУНД) ------
-        if round_found == game.current_round:
-            # Начисление
-            if text.startswith("+") and text.endswith("б"):
-                number_part = text[1:-1]
-                if number_part.isdigit():
-                    if game.photos_this_round[author_id] == "REPEAT":
-                        await update.message.reply_text("✖️ Фото не участвует в раунде, его нельзя оценивать. ✖️")
-                        return
-                    points = int(number_part)
-                    pdata["score"] += points
-                    nickname_display = f"@{pdata['nickname']}" if game.show_nicks else ""
-                    await update.message.reply_text(f"💸 Автору {nickname_display} зачислено {points}б.")
-                    await context.bot.send_message(chat_id=author_id, text=f"💸 Вам зачислено {points}б. Общая сумма: {pdata['score']}б.")
+    # --- БАЛЛЫ ---
+    if round_found == game.current_round:
+        if (text.startswith("+") or text.startswith("-")) and text.endswith("б"):
+            try:
+                # Определяем знак и число
+                sign = 1 if text.startswith("+") else -1
+                points = int(text[1:-1]) * sign
+                
+                if game.photos_this_round.get(author_id) == "REPEAT":
+                    await update.message.reply_text("✖️ Фото на повторе, нельзя оценивать.")
                     return
 
-            # Снятие
-            if text.startswith("-") and text.endswith("б"):
-                num = text[1:-1]
-                if num.isdigit():
-                    points = int(num)
-                    pdata["score"] -= points
-                    await update.message.reply_text("Баллы сняты.")
+                pdata["score"] += points
+
+                # ЗАПИСЬ ДЛЯ ИТОГОВОЙ ТАБЛИЦЫ
+                if "detailed_scores" not in pdata: pdata["detailed_scores"] = {}
+                if user_id in pdata["detailed_scores"]:
+                    pdata["detailed_scores"][user_id]["points"] += points
+                else:
+                    pdata["detailed_scores"][user_id] = {"name": judge_name, "points": points}
+
+                await update.message.reply_text(f"💸 {judge_name} {'начислил(а)' if sign > 0 else 'снял(а)'} {abs(points)}б.")
+                try:
                     await context.bot.send_message(
                         chat_id=author_id,
-                        text=f"У вас сняли {points}б. Общая сумма: {pdata['score']}б."
+                        text=f"💸 {judge_name} {'начислил(а)' if sign > 0 else 'снял(а)'} вам {abs(points)}б. (Всего: {pdata['score']}б)"
                     )
-                    return
+                except: pass
+            except ValueError: pass
+            return
 
-            # Повторка фото
-            if text in ["повтори", "повтор", "повторка"]:
-                game.photos_this_round[author_id] = "REPEAT"
-                await context.bot.edit_message_caption(
-                    chat_id=MAIN_CHAT_ID,
-                    message_id=reply_msg.message_id,
-                    caption="⛔️ Фото отклонено, отправьте новое."
-                )
-                await context.bot.send_message(chat_id=author_id, text="⛔️ Ваше фото отклонено, отправьте новое.")
-                return
+    if text in ["повтор", "повтори", "переделай"]:
+        if is_host:
+            game.photos_this_round[author_id] = "REPEAT"
+            try: await context.bot.edit_message_caption(chat_id=MAIN_CHAT_ID, message_id=replied_id, caption="⛔️ ПОВТОР ⛔️")
+            except: pass
+            await update.message.reply_text("⛔️ Фото отклонено.")
+            try: await context.bot.send_message(chat_id=author_id, text="⛔️ Повтор. Пришлите новое!")
+            except: pass
+
             
 # -------------------- ЗАВЕРШЕНИЕ РАУНДА --------------------
 async def stop_photo_reception(game: Game, context: ContextTypes.DEFAULT_TYPE):
@@ -913,29 +1073,47 @@ def escape_markdown(text):
     return re.sub(r'([_*[\]()~`>#+-=|{}.!])', r'\\\1', text)
 
 async def end_game(game: Game, context: ContextTypes.DEFAULT_TYPE):
-    """Итоговое завершение игры с отправкой результатов"""
-    if not game:
-        return
-
+    if not game: return
     game.round_active = False
 
-    # Подготовка результатов
     text_lines = ["🏆 *Результаты игры:*"]
+    
+    # Сортировка по баллам
     sorted_participants = sorted(
         game.participants.values(),
         key=lambda x: (x["score"], -x.get("round_out", 0)),
         reverse=True
     )
+
     for pdata in sorted_participants:
         user_display = f"@{pdata['username']}" if pdata.get("username") else pdata["nickname"]
-        line = f"{escape_markdown(user_display)} — {pdata['score']} б"
+        score = pdata['score']
+        
+        # Основная строка: Имя - 10б
+        line = f"{escape_markdown(user_display)} — {score} б"
+        
+        # ДОБАВЛЯЕМ РАЗБИВКУ (кто сколько дал)
+        detailed = pdata.get("detailed_scores", {})
+        if detailed:
+            # Собираем части типа "5 от дашули"
+            parts = []
+            for d in detailed.values():
+                if d['points'] != 0:
+                    parts.append(f"{d['points']} от {d['name']}")
+            
+            if parts:
+                # Добавляем в скобках к строке результата
+                # Важно: в MarkdownV2 скобки нужно экранировать \( \)
+                line += f" \\({', '.join(parts)}\\)"
+        
         if pdata.get("eliminated"):
             line += f" ☠️ выбыл в раунде {pdata.get('round_out', '?')}"
+        
         text_lines.append(line)
 
     text = "\n".join(text_lines)
 
-    # Отправка результатов в тему
+    # Отправка в чат
     await context.bot.send_message(
         chat_id=game.chat_id,
         message_thread_id=game.topic_id,
@@ -1052,6 +1230,7 @@ async def host_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Переходим на следующий раунд
         game.current_round += 1
         game.current_ref_sent = False
+        game.photo_reception_active = True
 
         # -----------------------------
         #         РЕФ-МОДЕ ВКЛ
